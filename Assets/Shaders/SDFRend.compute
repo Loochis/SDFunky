@@ -1,0 +1,376 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWTexture2D<float4> Result; // This will be the texture rendered by the camera
+
+float4x4 _CameraToWorld;            // Camera projection matricies
+float4x4 _CameraInverseProjection;
+
+// MARCH VARS -------------- //
+int marchDepth; // How many times the shader will march
+float epsilon;  // How close the ray has to be to detect a hit
+float smoothAmount;
+float maxDepth;
+// ------------------------- //
+
+// RENDER VARS -- PHONG REFL //
+float ka;   // Ambient Comp
+float kd;   // Diffuse Comp
+float ks;   // Specular Comp
+float kn;   // Shininess Constants
+// ------------------------- //
+
+// SHAPE TYPES ------------- //
+const uint Sphere = 0u;
+const uint Box = 1u;
+const uint Cylinder = 2u;
+const uint TriPrism = 3u;
+const uint Torus = 4u;
+const uint Cone = 5u;
+const uint Capsule = 6u;
+// ------------------------- //
+
+// MANDELBULB EQ
+int bulbIters;
+float bailout;
+float power;
+
+// Edit Stack
+struct SDFEdit {
+    uint opType;        // 0: Union, 1: Intersect, 2: SubThis, 3: SubThat
+    float smoothing;    // Amount to smooth
+    uint shape;         // shape this edit represents
+    float4x4 iMatrix;   // inverse TransformMatrix of the shape
+    float4 args1;       // shape args1 (radius, rounding, etc...)
+    float4 args2;       // shape args2 (radius, rounding, etc...)
+};
+
+int numEdits;
+StructuredBuffer<SDFEdit> SDFEditStack;
+
+int selection;
+int erroring;
+
+float3 glowCol;
+
+// Ray struct to store camera frustum pos and dir
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+// FUNCTIONS / CONSTTRUCTORS ---------------------------------------------------------------------------------------------------
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    // Transform the camera origin to world space
+    float3 origin = mul(_CameraToWorld, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+
+    // Invert the perspective projection of the view-space position
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0.0f, 1.0f)).xyz;
+    // Transform the direction from camera to world space and normalize
+    direction = mul(_CameraToWorld, float4(direction, 0.0f)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+float smoothmin (float sdfA, float sdfB, float k) {
+    float h = clamp(0.5 + 0.5 * (sdfB - sdfA) / k, 0.0, 1.0);
+    return lerp(sdfB, sdfA, h) - k * h * (1.0 - h);
+}
+
+float smoothmax (float sdfA, float sdfB, float k) {
+    float h = clamp(0.5 - 0.5 * (sdfB - sdfA) / k, 0.0, 1.0);
+    return lerp(sdfB, sdfA, h) + k * h * (1.0 - h);
+}
+
+float smoothmaxsub (float sdfA, float sdfB, float k) {
+    float h = clamp(0.5 - 0.5 * (sdfB + sdfA) / k, 0.0, 1.0);
+    return lerp(sdfB, -sdfA, h) + k * h * (1.0 - h);
+}
+
+// Samples the SDF of the mandelbulb at point P
+float mandelBulbSDF(float3 p) {
+    float3 z = p;
+    float dr = 1.0;
+    float r = 0.0;
+    for (int i = 0; i < bulbIters; i++) {
+        r = length(z);
+        if (r > bailout) 
+            break;
+
+        // convert to polar coordinates
+        float theta = acos(z.z / r);
+        float phi = atan2(z.y, z.x);
+        dr = pow(r, power - 1.0) * power * dr + 1.0;
+
+        // scale and rotate the point
+        float zr = pow(r, power);
+        theta = theta * power;
+        phi = phi * power;
+
+        // convert back to cartesian coordinates
+        z = zr * float3(sin(theta) * cos(phi), sin(phi) * sin(theta), cos(theta));
+        z += p;
+    }
+    return 0.5 * log(r) * r / dr;
+}
+
+// samples SDF of a sphere at point P
+float sphereSDF(float3 p, float3 args) // x: radius
+{
+    return length(p) - args.x;
+}
+
+float boxSDF(float3 p, float4 args) // xyz: box lengths
+{
+    float3 q = abs(p) - args.xyz;
+    return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+
+float cylinderSDF(float3 p, float4 args) // x: height, y: radius
+{
+    float2 d = abs(float2(length(p.xz), p.y)) - float2(args.x, args.y);
+    return min(max(d.x, d.y), 0.0) + length(max(d, 0.0));
+}
+
+float triPrismSDF(float3 p, float4 args) // xy: side length / height
+{
+    float3 q = abs(p);
+    return max(q.z - args.y, max(q.x * 0.866025 + p.y * 0.5, -p.y) - args.x * 0.5);
+}
+
+float torusSDF(float3 p, float4 args) // x: big radius, y: little radius
+{
+    float2 q = float2(length(p.xz) - args.x, p.y);
+    return length(q) - args.y;
+}
+
+float coneSDF(float3 p, float4 args) // x: base width, y: height
+{
+    float2 q = float2(args.x, -args.y);
+
+    float2 w = float2(length(p.xz), p.y);
+    float2 a = w - q * clamp(dot(w, q) / dot(q, q), 0.0, 1.0);
+    float2 b = w - q * float2(clamp(w.x / q.x, 0.0, 1.0), 1.0);
+    float k = sign(q.y);
+    float d = min(dot(a, a), dot(b, b));
+    float s = max(k * (w.x * q.y - w.y * q.x), k * (w.y - q.y));
+    return sqrt(d) * sign(s);
+}
+
+
+float capsuleSDF(float3 p, float4 args1, float4 args2) // a1.xyz: aPos, a2.xyz: bPos, a2.w: radius
+{
+    float3 pa = p - args1.xyz, ba = args2.xyz - args1.xyz;
+    float h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
+    return length(pa - ba * h) - args2.w;
+}
+
+
+float sceneSDF(float3 p, int maxEditLevel) {
+    if (numEdits == 0)
+        return 0;
+
+    float totalSDF = 1;
+    for (int i = 0; i < maxEditLevel; i++) {
+        SDFEdit tSDFE = SDFEditStack[i];
+        float3 transformedPos = mul(tSDFE.iMatrix, float4(p, 1.0)).xyz;
+        float sdf = 1;
+        switch (tSDFE.shape) {
+            case 0u:
+                sdf = sphereSDF(transformedPos, tSDFE.args1);
+                break;
+            case 1u:
+                sdf = boxSDF(transformedPos, tSDFE.args1);
+                break;
+            case 2u:
+                sdf = cylinderSDF(transformedPos, tSDFE.args1);
+                break;
+            case 3u:
+                sdf = triPrismSDF(transformedPos, tSDFE.args1);
+                break;
+            case 4u:
+                sdf = torusSDF(transformedPos, tSDFE.args1);
+                break;
+            case 5u:
+                sdf = coneSDF(transformedPos, tSDFE.args1);
+                break;
+            case 6u:
+                sdf = capsuleSDF(transformedPos, tSDFE.args1, tSDFE.args2);
+                break;
+            default:
+                break;
+        }
+
+        // TODO: replace with proper func
+        if (i == 0)
+            totalSDF = sdf;
+        else
+            switch (tSDFE.opType) {
+                case 0u:
+                    totalSDF = smoothmin(totalSDF, sdf, tSDFE.smoothing);
+                    break;
+                case 1u:
+                    totalSDF = smoothmax(totalSDF, sdf, tSDFE.smoothing);
+                    break;
+                case 2u:
+                    totalSDF = smoothmaxsub(sdf, totalSDF, tSDFE.smoothing);
+                    break;
+                case 3u:
+                    totalSDF = smoothmaxsub(totalSDF, sdf, tSDFE.smoothing);
+                    break;
+                default:
+                    break;
+            }
+    }
+    return totalSDF;
+}
+
+float3 estimateNormal(float3 p, int maxEditLevel) {
+    return normalize(float3(
+        sceneSDF(float3(p.x + epsilon, p.y, p.z), maxEditLevel) - sceneSDF(float3(p.x - epsilon, p.y, p.z), maxEditLevel),
+        sceneSDF(float3(p.x, p.y + epsilon, p.z), maxEditLevel) - sceneSDF(float3(p.x, p.y - epsilon, p.z), maxEditLevel),
+        sceneSDF(float3(p.x, p.y, p.z + epsilon), maxEditLevel) - sceneSDF(float3(p.x, p.y, p.z - epsilon), maxEditLevel)
+    ));
+}
+
+float getShadow(float3 p, int maxEditLevel) {
+
+    Ray ray = CreateRay(p, normalize(float3(1,1,-1)));
+
+    int numSteps = 0;
+    float depth = 0;
+    bool hit = false;
+
+    for (int i = 0; i < marchDepth; i++) {
+        float sdf = sceneSDF(ray.origin + (ray.direction * depth), maxEditLevel);
+
+        if (sdf < epsilon) {
+            hit = true;
+            break;
+        }
+
+        depth += sdf;
+        numSteps++;
+
+        if (depth > maxDepth)
+            break;
+    }
+
+    if (hit)
+        return 0.0;
+    else
+        return 1.0 -((float)numSteps / (float)marchDepth);
+}
+
+// Phong model for lighting scen
+float getLighting(float3 norm, float3 lightDir, float3 viewDir) {
+    float3 rfloat = 2 * dot(norm, lightDir) * norm - lightDir;
+    float specular = pow(max(dot(viewDir, rfloat), 0), kn);
+    float diffuse = max(0, dot(norm, -lightDir));
+
+    return ks*specular + kd*diffuse;
+}
+
+float3 renderPhong(Ray ray) {
+    int numSteps = 0;
+    float depth = 0;
+    bool hit = false;
+
+    for (int i = 0; i < marchDepth; i++) {
+
+        float sdf = sceneSDF(ray.origin + (ray.direction * depth), numEdits);
+
+        if (sdf < epsilon) {
+            hit = true;
+            break;
+        }
+
+        depth += sdf;
+        numSteps++;
+
+        if (depth > maxDepth)
+            break;
+    }
+
+    float3 pos = ray.origin + (ray.direction * depth);
+
+    float3 norm = estimateNormal(pos, numEdits);
+
+    float ao = 1.0 - ((float)numSteps / (float)marchDepth);
+
+    if (hit) {
+        float val = (ka + getLighting(norm, -normalize(float3(1, 1, -1)), ray.direction) * getShadow(ray.origin + (ray.direction * (depth - epsilon)), numEdits)) * ao;
+        return float3(val, val, val);
+    }
+    else
+        return float3(0, 0, 0);
+}
+
+float3 renderGlowToSelection(Ray ray) {
+    int specialSteps = erroring;
+    if (erroring < 0)
+        specialSteps = selection;
+    if (selection < 0)
+        return float3(0, 0, 0);
+
+    int numSteps = 0;
+    float depth = 0;
+    bool hit = false;
+
+    for (int i = 0; i < marchDepth; i++) {
+
+        float sdf = sceneSDF(ray.origin + (ray.direction * depth), specialSteps+1);
+
+        if (sdf < epsilon) {
+            hit = true;
+            break;
+        }
+
+        depth += sdf;
+        numSteps++;
+
+        if (depth > maxDepth)
+            break;
+    }
+
+    float ao = 1.0 - ((float)numSteps / (float)marchDepth);  
+
+    if (hit)
+        return float3(0, 0, 0);
+    else {
+        float glow = pow(2.0 - ao * 2, 4)*100;
+        return glow*glowCol;
+    }
+}
+
+[numthreads(32,16,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+
+    //TEMP
+
+    // Get the dimensions of the RenderTexture
+    uint width, height;
+    Result.GetDimensions(width, height);
+
+    // Transform pixel to [-1,1] range
+    float2 uv = float2((id.xy + float2(0.5f, 0.5f)) / float2(width, height) * 2.0f - 1.0f);
+    // Get a ray for the UVs
+    Ray ray = CreateCameraRay(uv);
+
+
+    float3 val = renderPhong(ray) + renderGlowToSelection(ray);
+
+    Result[id.xy] = float4(val.x, val.y, val.z, 1.0);
+}
